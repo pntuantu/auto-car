@@ -25,24 +25,7 @@
 static uint32_t speed = 150;
 
 // =========================
-// LCD I2C PINS
-// =========================
-#define I2C_MASTER_NUM I2C_NUM_0
-#define I2C_MASTER_SDA_IO 18
-#define I2C_MASTER_SCL_IO 46
-#define I2C_MASTER_FREQ_HZ 100000
-#define LCD_ADDR 0x27
-
-// PCF8574 bit mapping
-#define LCD_RS 0x80
-#define LCD_RW 0x40
-#define LCD_EN 0x20
-#define LCD_BL 0x10
-
-static uint8_t lcd_backlight = LCD_BL;
-
-// =========================
-// PWM
+// PWM CONTROL
 // =========================
 static void pwm_set(uint32_t duty_left, uint32_t duty_right)
 {
@@ -52,6 +35,25 @@ static void pwm_set(uint32_t duty_left, uint32_t duty_right)
     ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty_right);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
 }
+
+// =========================
+// LCD I2C PINS
+// =========================
+#define I2C_MASTER_NUM I2C_NUM_0
+#define I2C_MASTER_SDA_IO 18
+#define I2C_MASTER_SCL_IO 9
+#define I2C_MASTER_FREQ_HZ 100000
+#define LCD_ADDR 0x27
+
+// =========================
+// PCF8574 BIT MAPPING (ĐÃ SỬA CHUẨN)
+// =========================
+#define LCD_RS 0x01
+#define LCD_RW 0x02
+#define LCD_EN 0x04
+#define LCD_BL 0x08
+
+static uint8_t lcd_backlight = LCD_BL;
 
 // =========================
 // LCD LOW LEVEL
@@ -66,25 +68,27 @@ static esp_err_t lcd_write_byte(uint8_t data)
         pdMS_TO_TICKS(100));
 }
 
+// Sửa hàm cấp xung Enable dài hơn một chút để I2C PCF8574 kịp xử lý
 static void lcd_pulse_enable(uint8_t data)
 {
-    lcd_write_byte(data | LCD_EN | lcd_backlight);
-    esp_rom_delay_us(1);
-    lcd_write_byte((data & (uint8_t)~LCD_EN) | lcd_backlight);
-    esp_rom_delay_us(50);
+    // data lúc này đã chứa LCD_RS, LCD_BL và 4 bit data. LCD_EN đang bằng 0.
+    lcd_write_byte(data | LCD_EN); // Kéo EN lên 1
+    esp_rom_delay_us(2);           // Chờ 2 micro-giây (cũ là 1us hơi sát giới hạn)
+    lcd_write_byte(data & ~LCD_EN); // Kéo EN xuống 0
+    esp_rom_delay_us(50);          // Thời gian để chip LCD thực thi lệnh thường
 }
 
-static void lcd_write4bits(uint8_t nibble, uint8_t mode)
+static void lcd_write4bits(uint8_t data_nibble, uint8_t mode)
 {
-    uint8_t data = (nibble & 0x0F) | mode | lcd_backlight;
+    uint8_t data = (data_nibble & 0xF0) | mode | lcd_backlight;
     lcd_write_byte(data);
     lcd_pulse_enable(data);
 }
 
 static void lcd_send(uint8_t value, uint8_t mode)
 {
-    lcd_write4bits((value >> 4) & 0x0F, mode);
-    lcd_write4bits(value & 0x0F, mode);
+    lcd_write4bits(value & 0xF0, mode);           // Gửi 4 bit cao trước
+    lcd_write4bits((value << 4) & 0xF0, mode);    // Dịch 4 bit thấp lên và gửi
 }
 
 static void lcd_command(uint8_t cmd)
@@ -99,10 +103,11 @@ static void lcd_data(uint8_t data)
     esp_rom_delay_us(50);
 }
 
+// Thay vTaskDelay bằng esp_rom_delay_us để đảm bảo chắc chắn đợi đủ 2ms
 static void lcd_clear(void)
 {
     lcd_command(0x01);
-    vTaskDelay(pdMS_TO_TICKS(3));
+    esp_rom_delay_us(2000); // Bắt buộc phải > 1.52ms
 }
 
 static void lcd_set_cursor(uint8_t col, uint8_t row)
@@ -136,21 +141,32 @@ static void lcd_print_line(uint8_t row, const char *text)
     lcd_print(buf);
 }
 
+// Thay toàn bộ quy trình Init bằng delay cứng để HD44780 không bị ngợp
 static void lcd_init_display(void)
 {
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(50)); // Chờ nguồn ổn định khi vừa bật (dùng vTaskDelay ở đây là OK vì 50ms đủ lớn)
 
-    lcd_write4bits(0x03, 0);
-    vTaskDelay(pdMS_TO_TICKS(5));
-    lcd_write4bits(0x03, 0);
-    esp_rom_delay_us(150);
-    lcd_write4bits(0x03, 0);
-    lcd_write4bits(0x02, 0);
+    // Quy trình "đánh thức" chuẩn của Datasheet
+    lcd_write4bits(0x30, 0);
+    esp_rom_delay_us(5000); // Bắt buộc đợi > 4.1ms
+    
+    lcd_write4bits(0x30, 0);
+    esp_rom_delay_us(200);  // Bắt buộc đợi > 100us
+    
+    lcd_write4bits(0x30, 0);
+    esp_rom_delay_us(200);
+    
+    // Bắt đầu ép sang chế độ giao tiếp 4-bit
+    lcd_write4bits(0x20, 0);
+    esp_rom_delay_us(200);
 
-    lcd_command(0x28);
-    lcd_command(0x0C);
-    lcd_command(0x06);
-    lcd_clear();
+    // Cấu hình các thông số
+    lcd_command(0x28); // 4-bit, 2 dòng, font 5x8
+    lcd_command(0x0C); // Bật màn hình, tắt con trỏ nhấp nháy
+    lcd_command(0x06); // Tự động dịch con trỏ từ trái sang phải
+    lcd_clear();       // Dọn sạch rác trên màn hình
+
+    ESP_LOGI(TAG, "LCD 16x2 initialized with backlight ON");
 }
 
 // =========================
@@ -159,7 +175,7 @@ static void lcd_init_display(void)
 static void lcd_show_status(const char *mode)
 {
     lcd_clear();
-    vTaskDelay(pdMS_TO_TICKS(2));
+    vTaskDelay(pdMS_TO_TICKS(1));  // Giảm từ 2ms
 
     lcd_print_line(0, "ESP32-S3 Robot");
     lcd_print_line(1, mode);
@@ -328,13 +344,19 @@ static void i2c_master_init(void)
 // =========================
 void app_main(void)
 {
+    // Setup UART stdio (enable stdin/stdout over serial)
+    esp_log_level_set("*", ESP_LOG_INFO);
+    
     motor_gpio_init();
     motor_pwm_init();
     i2c_master_init();
     lcd_init_display();
 
+    // Unbuffered I/O
     setvbuf(stdin, NULL, _IONBF, 0);
     setvbuf(stdout, NULL, _IONBF, 0);
+    
+    ESP_LOGI(TAG, "System ready for serial input");
 
     vTaskDelay(pdMS_TO_TICKS(2000));
     stop_motor();
@@ -381,11 +403,14 @@ void app_main(void)
             break;
         case '\n':
         case '\r':
+            // Skip newline without LCD update
             break;
         default:
-            lcd_show_status("INVALID CMD");
-            ESP_LOGW(TAG, "Invalid command");
+            ESP_LOGW(TAG, "Invalid command: %c", ch);
             break;
         }
+        
+        // Small yield to other tasks
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }

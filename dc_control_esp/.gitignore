@@ -48,6 +48,10 @@ cmake_install.cmake
 install_manifest.txt
 CTestTestfile.cmake
 
+# VS Code local settings (machine-specific)
+.vscode/c_cpp_properties.json
+.vscode/settings.json
+
 # Python environment files
 *.pyc
 *.pyo

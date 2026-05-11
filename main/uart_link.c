@@ -1,222 +1,121 @@
 #include "uart_link.h"
-#include "driver/uart.h"
-#include "driver/gpio.h"
+#include "driver/usb_serial_jtag.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_log.h"
+#include "kinematics.h"
+#include "bno055.h"
 #include <string.h>
 
 static const char *TAG = "UART_LINK";
 
-// Frame structure
+// Cấu trúc gói tin TX (ESP32 gửi Odom -> Pi)
+// Yêu cầu GCC đóng gói chặt chẽ không có byte đệm (padding)
+#pragma pack(push, 1)
 typedef struct {
-    uint8_t start;
-    uint8_t msg_type;
-    uint16_t data_length;
-    uint8_t data[FRAME_MAX_LENGTH];
-    uint8_t checksum;
-    uint8_t end;
-} frame_t;
+    uint8_t header[2]; // 0xAA, 0x55
+    uint8_t type;      // 0x01 (Bản tin Odom)
+    uint8_t length;    // Chiều dài payload
+    float odom_x;
+    float odom_y;
+    float odom_theta;
+    float linear_v;
+    float angular_w;
+    float quat_w;
+    float quat_x;
+    float quat_y;
+    float quat_z;
+    uint8_t calib_stat; // Gộp chung trạng thái calib
+    uint8_t checksum;  // XOR toàn bộ payload
+} OdomPacket_t;
 
-static velocity_command_t velocity_command = {0, 0, 0};
-static uint32_t last_heartbeat_ms = 0;
+// Cấu trúc gói tin RX (Pi gửi Cmd_vel -> ESP32)
+typedef struct {
+    float linear_v;
+    float angular_w;
+} CmdVelPayload_t;
+#pragma pack(pop)
 
-/**
- * Calculate checksum
- */
-static uint8_t calculate_checksum(const uint8_t *data, size_t len)
-{
-    uint8_t checksum = 0;
-    for (size_t i = 0; i < len; i++) {
-        checksum ^= data[i];
+static uint8_t calculate_checksum(const uint8_t* data, size_t length) {
+    uint8_t crc = 0;
+    for (size_t i = 0; i < length; i++) {
+        crc ^= data[i];
     }
-    return checksum;
+    return crc;
 }
 
-/**
- * Send frame over UART
- */
-static esp_err_t uart_send_frame(const frame_t *frame)
-{
-    uint8_t buffer[FRAME_MAX_LENGTH + 6];
-    size_t pos = 0;
-    
-    buffer[pos++] = frame->start;
-    buffer[pos++] = frame->msg_type;
-    buffer[pos++] = (frame->data_length >> 8) & 0xFF;
-    buffer[pos++] = frame->data_length & 0xFF;
-    
-    memcpy(&buffer[pos], frame->data, frame->data_length);
-    pos += frame->data_length;
-    
-    buffer[pos++] = calculate_checksum(buffer, pos);
-    buffer[pos++] = frame->end;
-    
-    uart_write_bytes(UART_LINK_PORT, (const char *)buffer, pos);
-    return ESP_OK;
-}
-
-/**
- * Parse received frame
- */
-static esp_err_t uart_parse_frame(uint8_t *buffer, size_t len, frame_t *frame)
-{
-    if (len < 6 || buffer[0] != FRAME_START_BYTE || buffer[len-1] != FRAME_END_BYTE) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    
-    frame->start = buffer[0];
-    frame->msg_type = buffer[1];
-    frame->data_length = (buffer[2] << 8) | buffer[3];
-    
-    if (frame->data_length > FRAME_MAX_LENGTH) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    
-    memcpy(frame->data, &buffer[4], frame->data_length);
-    frame->checksum = buffer[4 + frame->data_length];
-    frame->end = buffer[5 + frame->data_length];
-    
-    // Verify checksum
-    uint8_t expected_checksum = calculate_checksum(buffer, 4 + frame->data_length);
-    if (expected_checksum != frame->checksum) {
-        return ESP_ERR_INVALID_CRC;
-    }
-    
-    return ESP_OK;
-}
-
-void uart_link_init(void)
-{
-    ESP_LOGI(TAG, "Initializing UART link with Pi");
-    
-    uart_config_t uart_config = {
-        .baud_rate = UART_LINK_BAUDRATE,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
+void uart_link_init(void) {
+    usb_serial_jtag_driver_config_t usb_cfg = {
+        .rx_buffer_size = 1024,
+        .tx_buffer_size = 1024
     };
-    
-    uart_driver_install(UART_LINK_PORT, UART_LINK_BUFFER_SIZE, 0, 0, NULL, 0);
-    uart_param_config(UART_LINK_PORT, &uart_config);
-    uart_set_pin(UART_LINK_PORT, UART_LINK_TX_PIN, UART_LINK_RX_PIN, 
-                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    
-    last_heartbeat_ms = esp_log_timestamp();
-    
-    ESP_LOGI(TAG, "UART link initialized at %d baud", UART_LINK_BAUDRATE);
+    usb_serial_jtag_driver_install(&usb_cfg);
+    ESP_LOGI(TAG, "USB Serial JTAG Link Initialized (Binary Protocol)");
 }
 
-void uart_link_send_velocity(float vx, float vy, float omega)
-{
-    frame_t frame = {FRAME_START_BYTE, MSG_TYPE_VELOCITY, 12, {0}, 0, FRAME_END_BYTE};
-    
-    // Pack float values as int16_t (scale by 100)
-    int16_t vx_i = (int16_t)(vx * 100);
-    int16_t vy_i = (int16_t)(vy * 100);
-    int16_t omega_i = (int16_t)(omega * 100);
-    
-    frame.data[0] = (vx_i >> 8) & 0xFF;
-    frame.data[1] = vx_i & 0xFF;
-    frame.data[2] = (vy_i >> 8) & 0xFF;
-    frame.data[3] = vy_i & 0xFF;
-    frame.data[4] = (omega_i >> 8) & 0xFF;
-    frame.data[5] = omega_i & 0xFF;
-    
-    frame.checksum = calculate_checksum(frame.data, frame.data_length);
-    uart_send_frame(&frame);
-}
+void uart_tx_task(void *arg) {
+    OdomPacket_t pkt;
+    pkt.header[0] = 0xAA;
+    pkt.header[1] = 0x55;
+    pkt.type = 0x01;
+    pkt.length = sizeof(OdomPacket_t) - 4; // Trừ header, type, length, checksum
 
-void uart_link_send_imu(float qw, float qx, float qy, float qz,
-                        float roll, float pitch, float yaw)
-{
-    frame_t frame = {FRAME_START_BYTE, MSG_TYPE_IMU_DATA, 28, {0}, 0, FRAME_END_BYTE};
-    
-    // Pack as int16_t (quaternion: scale by 1000, angles: scale by 100)
-    int16_t *data = (int16_t *)frame.data;
-    data[0] = (int16_t)(qw * 1000);
-    data[1] = (int16_t)(qx * 1000);
-    data[2] = (int16_t)(qy * 1000);
-    data[3] = (int16_t)(qz * 1000);
-    data[4] = (int16_t)(roll * 100);
-    data[5] = (int16_t)(pitch * 100);
-    data[6] = (int16_t)(yaw * 100);
-    
-    frame.checksum = calculate_checksum(frame.data, frame.data_length);
-    uart_send_frame(&frame);
-}
+    while (1) {
+        // 1. Lấy dữ liệu Odom từ Kinematics
+        kinematics_get_odom(&pkt.odom_x, &pkt.odom_y, &pkt.odom_theta, &pkt.linear_v, &pkt.angular_w);
+        
+        // 2. Lấy dữ liệu IMU
+        pkt.quat_w = g_bno_quat_w;
+        pkt.quat_x = g_bno_quat_x;
+        pkt.quat_y = g_bno_quat_y;
+        pkt.quat_z = g_bno_quat_z;
 
-void uart_link_send_encoders(float encoder_data[4])
-{
-    frame_t frame = {FRAME_START_BYTE, MSG_TYPE_ENCODER_DATA, 8, {0}, 0, FRAME_END_BYTE};
-    
-    int16_t *data = (int16_t *)frame.data;
-    for (int i = 0; i < 4; i++) {
-        data[i] = (int16_t)(encoder_data[i] * 100);
+        // Gộp trạng thái calib (2 bit mỗi loại)
+        pkt.calib_stat = (g_bno_calib_sys << 6) | (g_bno_calib_gyro << 4) | (g_bno_calib_accel << 2) | g_bno_calib_mag;
+
+        // 3. Tính Checksum (từ phần byte payload)
+        uint8_t* payload_ptr = (uint8_t*)&pkt.odom_x;
+        pkt.checksum = calculate_checksum(payload_ptr, pkt.length);
+
+        // 4. Bắn mảng byte qua USB
+        usb_serial_jtag_write_bytes((const void*)&pkt, sizeof(OdomPacket_t), portMAX_DELAY);
+
+        vTaskDelay(pdMS_TO_TICKS(50)); // Publish Odom ở 20Hz (Đủ mượt cho Nav2)
     }
-    
-    frame.checksum = calculate_checksum(frame.data, frame.data_length);
-    uart_send_frame(&frame);
 }
 
-void uart_link_send_telemetry(const telemetry_t *telemetry)
-{
-    frame_t frame = {FRAME_START_BYTE, MSG_TYPE_TELEMETRY, 10, {0}, 0, FRAME_END_BYTE};
-    
-    int16_t voltage = (int16_t)(telemetry->battery_voltage * 100);
-    int16_t current = (int16_t)(telemetry->current_draw * 100);
-    
-    memcpy(&frame.data[0], &voltage, 2);
-    memcpy(&frame.data[2], &current, 2);
-    frame.data[4] = telemetry->system_status;
-    frame.data[5] = telemetry->error_code;
-    
-    frame.checksum = calculate_checksum(frame.data, frame.data_length);
-    uart_send_frame(&frame);
-}
+void uart_rx_task(void *arg) {
+    uint8_t rx_buf[64];
+    int rx_state = 0;
+    CmdVelPayload_t payload;
+    uint8_t rx_idx = 0;
+    uint8_t expected_len = sizeof(CmdVelPayload_t);
 
-uint8_t uart_link_receive(void)
-{
-    uint8_t buffer[FRAME_MAX_LENGTH + 6];
-    int len = uart_read_bytes(UART_LINK_PORT, buffer, sizeof(buffer), pdMS_TO_TICKS(10));
-    
-    if (len <= 0) {
-        return 0;
+    while (1) {
+        uint8_t ch;
+        int len = usb_serial_jtag_read_bytes(&ch, 1, portMAX_DELAY);
+        if (len > 0) {
+            // State Machine Parse Gói Nhị Phân
+            switch (rx_state) {
+                case 0: if (ch == 0xAA) rx_state = 1; break; // Wait Header 1
+                case 1: if (ch == 0x55) rx_state = 2; else rx_state = 0; break; // Wait Header 2
+                case 2: if (ch == 0x02) rx_state = 3; else rx_state = 0; break; // Wait Type (0x02 = cmd_vel)
+                case 3: if (ch == expected_len) { rx_state = 4; rx_idx = 0; } else rx_state = 0; break;
+                case 4: // Read Payload
+                    rx_buf[rx_idx++] = ch;
+                    if (rx_idx >= expected_len) rx_state = 5;
+                    break;
+                case 5: // Checksum
+                    if (ch == calculate_checksum(rx_buf, expected_len)) {
+                        memcpy(&payload, rx_buf, expected_len);
+                        // Nhận thành công, gửi lệnh xuống Kinematics
+                        kinematics_set_target(payload.linear_v, payload.angular_w);
+                    } else {
+                        ESP_LOGW(TAG, "RX Checksum Error!");
+                    }
+                    rx_state = 0;
+                    break;
+            }
+        }
     }
-    
-    frame_t frame;
-    if (uart_parse_frame(buffer, len, &frame) != ESP_OK) {
-        return 0;
-    }
-    
-    last_heartbeat_ms = esp_log_timestamp();
-    
-    // Process message
-    if (frame.msg_type == MSG_TYPE_VELOCITY) {
-        // Parse velocity command
-        int16_t *data = (int16_t *)frame.data;
-        velocity_command.vx = data[0] / 100.0f;
-        velocity_command.vy = data[1] / 100.0f;
-        velocity_command.omega = data[2] / 100.0f;
-    }
-    else if (frame.msg_type == MSG_TYPE_EMERGENCY_STOP) {
-        velocity_command.vx = 0.0f;
-        velocity_command.vy = 0.0f;
-        velocity_command.omega = 0.0f;
-        ESP_LOGW(TAG, "Emergency stop received!");
-    }
-    
-    return frame.msg_type;
-}
-
-velocity_command_t* uart_link_get_velocity_command(void)
-{
-    return &velocity_command;
-}
-
-uint8_t uart_link_is_connected(void)
-{
-    uint32_t current_time = esp_log_timestamp();
-    // Check if heartbeat received within 1 second
-    return (current_time - last_heartbeat_ms) < 1000;
 }

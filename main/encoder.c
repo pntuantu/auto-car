@@ -1,132 +1,76 @@
 #include "encoder.h"
-#include "driver/gpio.h"
-#include "driver/pcnt.h"
+#include "driver/pulse_cnt.h"
 #include "esp_log.h"
 
-static const char *TAG = "ENCODER_MODULE";
+static const char *TAG = "ENCODER";
 
-// Encoder data structure
-typedef struct {
-    uint8_t pin_a;
-    uint8_t pin_b;
-    pcnt_unit_t pcnt_unit;
-    int32_t prev_count;
-    float velocity;
-    float rpm;
-} encoder_data_t;
+// Sơ đồ chân Encoder
+#define ENC_FL_A 18
+#define ENC_FL_B 17
+#define ENC_RL_A 1
+#define ENC_RL_B 2
+#define ENC_FR_A 11
+#define ENC_FR_B 10
+#define ENC_RR_A 13
+#define ENC_RR_B 12
 
-static encoder_data_t encoders[4] = {
-    {ENCODER_FL_A_PIN, ENCODER_FL_B_PIN, PCNT_UNIT_0, 0, 0, 0},
-    {ENCODER_FR_A_PIN, ENCODER_FR_B_PIN, PCNT_UNIT_1, 0, 0, 0},
-    {ENCODER_BL_A_PIN, ENCODER_BL_B_PIN, PCNT_UNIT_2, 0, 0, 0},
-    {ENCODER_BR_A_PIN, ENCODER_BR_B_PIN, PCNT_UNIT_3, 0, 0, 0},
-};
+// Lưu trữ các Handles của 4 bộ đếm
+static pcnt_unit_handle_t pcnt_FL = NULL;
+static pcnt_unit_handle_t pcnt_RL = NULL;
+static pcnt_unit_handle_t pcnt_FR = NULL;
+static pcnt_unit_handle_t pcnt_RR = NULL;
 
-void encoder_init(void)
-{
-    ESP_LOGI(TAG, "Initializing encoder system");
+// Hàm nội bộ giúp setup 1 bộ Encoder Quadrature (Chế độ x4)
+static pcnt_unit_handle_t setup_single_encoder(int pin_a, int pin_b) {
+    pcnt_unit_handle_t unit;
+    pcnt_unit_config_t unit_config = {
+        .high_limit = 32767,
+        .low_limit = -32768,
+    };
+    pcnt_new_unit(&unit_config, &unit);
+
+    // Bộ lọc nhiễu (Glitch Filter)
+    pcnt_glitch_filter_config_t filter_config = {.max_glitch_ns = 1000};
+    pcnt_unit_set_glitch_filter(unit, &filter_config);
+
+    pcnt_channel_handle_t chan_a, chan_b;
+    pcnt_chan_config_t chan_a_cfg = {.edge_gpio_num = pin_a, .level_gpio_num = pin_b};
+    pcnt_chan_config_t chan_b_cfg = {.edge_gpio_num = pin_b, .level_gpio_num = pin_a};
+    pcnt_new_channel(unit, &chan_a_cfg, &chan_a);
+    pcnt_new_channel(unit, &chan_b_cfg, &chan_b);
+
+    // Thiết lập đọc Quadrature Phase để nhận biết chiều quay
+    pcnt_channel_set_edge_action(chan_a, PCNT_CHANNEL_EDGE_ACTION_DECREASE, PCNT_CHANNEL_EDGE_ACTION_INCREASE);
+    pcnt_channel_set_level_action(chan_a, PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE);
+    pcnt_channel_set_edge_action(chan_b, PCNT_CHANNEL_EDGE_ACTION_INCREASE, PCNT_CHANNEL_EDGE_ACTION_DECREASE);
+    pcnt_channel_set_level_action(chan_b, PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE);
+
+    pcnt_unit_enable(unit);
+    pcnt_unit_clear_count(unit);
+    pcnt_unit_start(unit);
     
-    for (int i = 0; i < 4; i++) {
-        // Configure GPIO pins for input
-        gpio_config_t io_conf = {
-            .pin_bit_mask = (1ULL << encoders[i].pin_a) | (1ULL << encoders[i].pin_b),
-            .mode = GPIO_MODE_INPUT,
-            .pull_up_en = GPIO_PULLUP_ENABLE,
-            .pull_down_en = GPIO_PULLDOWN_DISABLE,
-            .intr_type = GPIO_INTR_DISABLE,
-        };
-        gpio_config(&io_conf);
-        
-        // Configure PCNT unit
-        pcnt_config_t pcnt_config = {
-            .pulse_gpio_num = encoders[i].pin_a,
-            .ctrl_gpio_num = encoders[i].pin_b,
-            .unit = encoders[i].pcnt_unit,
-            .channel = PCNT_CHANNEL_0,
-            .pos_mode = PCNT_COUNT_INC,
-            .neg_mode = PCNT_COUNT_DEC,
-            .lctrl_mode = PCNT_MODE_REVERSE,
-            .hctrl_mode = PCNT_MODE_KEEP,
-            .counter_h_lim = 32767,
-            .counter_l_lim = -32768,
-        };
-        pcnt_unit_config(&pcnt_config);
-        
-        // Initialize PCNT
-        pcnt_counter_pause(encoders[i].pcnt_unit);
-        pcnt_counter_clear(encoders[i].pcnt_unit);
-        pcnt_counter_resume(encoders[i].pcnt_unit);
-    }
-    
-    ESP_LOGI(TAG, "Encoder initialization complete");
+    return unit;
 }
 
-void encoder_update(void)
-{
-    for (int i = 0; i < 4; i++) {
-        int16_t count = 0;
-        pcnt_get_counter_value(encoders[i].pcnt_unit, &count);
-        
-        // Calculate velocity (distance per 20ms)
-        int32_t pulse_delta = count - encoders[i].prev_count;
-        float distance = (float)pulse_delta * WHEEL_CIRCUMFERENCE / ENCODER_PPR;
-        encoders[i].velocity = distance / 0.02f; // 20ms update rate
-        
-        // Calculate RPM
-        encoders[i].rpm = (float)pulse_delta * 50.0f / ENCODER_PPR; // 50 = 1000ms / 20ms
-        
-        encoders[i].prev_count = count;
-    }
-}
-
-int32_t encoder_get_count(uint8_t encoder_id)
-{
-    if (encoder_id >= 4) {
-        ESP_LOGW(TAG, "Invalid encoder ID: %d", encoder_id);
-        return 0;
-    }
+void encoder_init(void) {
+    pcnt_FL = setup_single_encoder(ENC_FL_A, ENC_FL_B);
+    pcnt_RL = setup_single_encoder(ENC_RL_A, ENC_RL_B);
+    pcnt_FR = setup_single_encoder(ENC_FR_A, ENC_FR_B);
+    pcnt_RR = setup_single_encoder(ENC_RR_A, ENC_RR_B);
     
-    int16_t count = 0;
-    pcnt_get_counter_value(encoders[encoder_id].pcnt_unit, &count);
-    return (int32_t)count;
+    ESP_LOGI(TAG, "4 Encoders initialized (Quadrature mode).");
 }
 
-float encoder_get_velocity(uint8_t encoder_id)
-{
-    if (encoder_id >= 4) {
-        ESP_LOGW(TAG, "Invalid encoder ID: %d", encoder_id);
-        return 0.0f;
-    }
-    
-    return encoders[encoder_id].velocity;
+void encoder_get_counts(int *count_fl, int *count_rl, int *count_fr, int *count_rr) {
+    if (pcnt_FL) pcnt_unit_get_count(pcnt_FL, count_fl);
+    if (pcnt_RL) pcnt_unit_get_count(pcnt_RL, count_rl);
+    if (pcnt_FR) pcnt_unit_get_count(pcnt_FR, count_fr);
+    if (pcnt_RR) pcnt_unit_get_count(pcnt_RR, count_rr);
 }
 
-float encoder_get_rpm(uint8_t encoder_id)
-{
-    if (encoder_id >= 4) {
-        ESP_LOGW(TAG, "Invalid encoder ID: %d", encoder_id);
-        return 0.0f;
-    }
-    
-    return encoders[encoder_id].rpm;
-}
-
-void encoder_reset(uint8_t encoder_id)
-{
-    if (encoder_id >= 4) {
-        ESP_LOGW(TAG, "Invalid encoder ID: %d", encoder_id);
-        return;
-    }
-    
-    pcnt_counter_pause(encoders[encoder_id].pcnt_unit);
-    pcnt_counter_clear(encoders[encoder_id].pcnt_unit);
-    pcnt_counter_resume(encoders[encoder_id].pcnt_unit);
-    encoders[encoder_id].prev_count = 0;
-}
-
-void encoder_reset_all(void)
-{
-    for (int i = 0; i < 4; i++) {
-        encoder_reset(i);
-    }
+void encoder_clear_counts(void) {
+    if (pcnt_FL) pcnt_unit_clear_count(pcnt_FL);
+    if (pcnt_RL) pcnt_unit_clear_count(pcnt_RL);
+    if (pcnt_FR) pcnt_unit_clear_count(pcnt_FR);
+    if (pcnt_RR) pcnt_unit_clear_count(pcnt_RR);
 }

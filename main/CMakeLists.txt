@@ -6,5 +6,5 @@ idf_component_register(
          "bno055.c" 
          "uart_link.c"
     INCLUDE_DIRS "."
-    REQUIRES driver i2c_driver esp_driver_gptimer
+    REQUIRES nvs_flash driver esp_driver_gptimer
 )

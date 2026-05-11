@@ -1,107 +1,84 @@
 #include "motor.h"
-#include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "esp_log.h"
+#include <stdlib.h> // cho hàm abs()
 
-static const char *TAG = "MOTOR_MODULE";
+static const char *TAG = "MOTOR";
 
-// Motor PWM configuration
-typedef struct {
-    uint8_t pwm_pin;
-    uint8_t dir_pin;
-    ledc_channel_t pwm_channel;
-    ledc_timer_t pwm_timer;
-} motor_config_t;
+// Cấu hình chân theo sơ đồ của bạn
+#define RPWM_RIGHT_PIN  4
+#define LPWM_RIGHT_PIN  5
+#define RPWM_LEFT_PIN   6
+#define LPWM_LEFT_PIN   7
 
-static motor_config_t motors[4] = {
-    {MOTOR_FL_PWM_PIN, MOTOR_FL_DIR_PIN, LEDC_CHANNEL_0, LEDC_TIMER_0},
-    {MOTOR_FR_PWM_PIN, MOTOR_FR_DIR_PIN, LEDC_CHANNEL_1, LEDC_TIMER_0},
-    {MOTOR_BL_PWM_PIN, MOTOR_BL_DIR_PIN, LEDC_CHANNEL_2, LEDC_TIMER_0},
-    {MOTOR_BR_PWM_PIN, MOTOR_BR_DIR_PIN, LEDC_CHANNEL_3, LEDC_TIMER_0},
-};
+#define PWM_FREQ_HZ     5000
+#define PWM_RESOLUTION  LEDC_TIMER_10_BIT // 0 - 1023
+#define PWM_MAX_VALUE   1023
 
-void motor_init(void)
-{
-    ESP_LOGI(TAG, "Initializing motor control system");
-    
-    // Configure LEDC timer
-    ledc_timer_config_t ledc_timer = {
+// Ánh xạ Kênh LEDC
+#define LEDC_CH_RIGHT_FWD LEDC_CHANNEL_0 // RPWM_RIGHT
+#define LEDC_CH_RIGHT_BWD LEDC_CHANNEL_1 // LPWM_RIGHT
+#define LEDC_CH_LEFT_FWD  LEDC_CHANNEL_2 // RPWM_LEFT
+#define LEDC_CH_LEFT_BWD  LEDC_CHANNEL_3 // LPWM_LEFT
+
+void motor_init(void) {
+    // 1. Cấu hình Timer
+    ledc_timer_config_t timer_cfg = {
         .speed_mode = LEDC_LOW_SPEED_MODE,
-        .timer_num = LEDC_TIMER_0,
-        .duty_resolution = LEDC_TIMER_10_BIT,
-        .freq_hz = PWM_FREQUENCY,
-        .clk_cfg = LEDC_AUTO_CLK,
+        .timer_num  = LEDC_TIMER_0,
+        .duty_resolution = PWM_RESOLUTION,
+        .freq_hz = PWM_FREQ_HZ,
+        .clk_cfg = LEDC_AUTO_CLK
     };
-    ledc_timer_config(&ledc_timer);
-    
-    // Configure PWM channels and direction GPIO pins
+    ledc_timer_config(&timer_cfg);
+
+    // 2. Cấu hình 4 Channel cho 4 chân PWM
+    int pins[4]     = {RPWM_RIGHT_PIN, LPWM_RIGHT_PIN, RPWM_LEFT_PIN, LPWM_LEFT_PIN};
+    int channels[4] = {LEDC_CH_RIGHT_FWD, LEDC_CH_RIGHT_BWD, LEDC_CH_LEFT_FWD, LEDC_CH_LEFT_BWD};
+
     for (int i = 0; i < 4; i++) {
-        // Configure PWM channel
-        ledc_channel_config_t ledc_channel = {
-            .gpio_num = motors[i].pwm_pin,
+        ledc_channel_config_t chan_cfg = {
             .speed_mode = LEDC_LOW_SPEED_MODE,
-            .channel = motors[i].pwm_channel,
-            .intr_type = LEDC_INTR_DISABLE,
-            .timer_sel = motors[i].pwm_timer,
-            .duty = 0,
-            .hpoint = 0,
+            .channel    = channels[i],
+            .timer_sel  = LEDC_TIMER_0,
+            .intr_type  = LEDC_INTR_DISABLE,
+            .gpio_num   = pins[i],
+            .duty       = 0,
+            .hpoint     = 0
         };
-        ledc_channel_config(&ledc_channel);
-        
-        // Configure direction GPIO pin
-        gpio_config_t io_conf = {
-            .pin_bit_mask = (1ULL << motors[i].dir_pin),
-            .mode = GPIO_MODE_OUTPUT,
-            .pull_up_en = GPIO_PULLUP_DISABLE,
-            .pull_down_en = GPIO_PULLDOWN_DISABLE,
-            .intr_type = GPIO_INTR_DISABLE,
-        };
-        gpio_config(&io_conf);
-        gpio_set_level(motors[i].dir_pin, 0);
+        ledc_channel_config(&chan_cfg);
     }
-    
-    ESP_LOGI(TAG, "Motor initialization complete");
+    ESP_LOGI(TAG, "Motor initialized with BTS7960 config.");
 }
 
-void motor_set_pwm(uint8_t motor_id, int16_t pwm_value)
-{
-    if (motor_id >= 4) {
-        ESP_LOGW(TAG, "Invalid motor ID: %d", motor_id);
-        return;
-    }
-    
-    // Clamp PWM value
-    if (pwm_value > MAX_PWM_VALUE) pwm_value = MAX_PWM_VALUE;
-    if (pwm_value < -MAX_PWM_VALUE) pwm_value = -MAX_PWM_VALUE;
-    
-    // Set direction
-    uint32_t direction = (pwm_value >= 0) ? 1 : 0;
-    gpio_set_level(motors[motor_id].dir_pin, direction);
-    
-    // Set PWM duty
-    uint32_t duty = (pwm_value < 0) ? -pwm_value : pwm_value;
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, motors[motor_id].pwm_channel, duty);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, motors[motor_id].pwm_channel);
-}
+void motor_set_pwm(int pwm_left, int pwm_right) {
+    // Giới hạn giá trị PWM từ -1023 đến 1023
+    if (pwm_left > PWM_MAX_VALUE) pwm_left = PWM_MAX_VALUE;
+    if (pwm_left < -PWM_MAX_VALUE) pwm_left = -PWM_MAX_VALUE;
+    if (pwm_right > PWM_MAX_VALUE) pwm_right = PWM_MAX_VALUE;
+    if (pwm_right < -PWM_MAX_VALUE) pwm_right = -PWM_MAX_VALUE;
 
-void motor_set_velocity(uint8_t motor_id, float velocity)
-{
-    // TODO: Convert velocity (m/s) to PWM value using calibration curve
-    // This requires encoder feedback and motor characterization
-    int16_t pwm_value = (int16_t)(velocity * 100); // Placeholder conversion
-    motor_set_pwm(motor_id, pwm_value);
-}
-
-void motor_stop_all(void)
-{
-    for (int i = 0; i < 4; i++) {
-        motor_set_pwm(i, 0);
+    // Điều khiển bánh Trái
+    if (pwm_left >= 0) {
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_LEFT_FWD, pwm_left);
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_LEFT_BWD, 0);
+    } else {
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_LEFT_FWD, 0);
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_LEFT_BWD, abs(pwm_left));
     }
-}
 
-void motor_stop(uint8_t motor_id)
-{
-    if (motor_id < 4) {
-        motor_set_pwm(motor_id, 0);
+    // Điều khiển bánh Phải
+    if (pwm_right >= 0) {
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RIGHT_FWD, pwm_right);
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RIGHT_BWD, 0);
+    } else {
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RIGHT_FWD, 0);
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RIGHT_BWD, abs(pwm_right));
     }
+
+    // Cập nhật Duty Cycle ra chân GPIO
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_LEFT_FWD);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_LEFT_BWD);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RIGHT_FWD);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CH_RIGHT_BWD);
 }

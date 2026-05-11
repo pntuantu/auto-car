@@ -58,7 +58,7 @@ void uart_tx_task(void *arg) {
     pkt.header[0] = 0xAA;
     pkt.header[1] = 0x55;
     pkt.type = 0x01;
-    pkt.length = sizeof(OdomPacket_t) - 4; // Trừ header, type, length, checksum
+    pkt.length = sizeof(OdomPacket_t) - 5; // Trừ header, type, length, checksum
 
     while (1) {
         // 1. Lấy dữ liệu Odom từ Kinematics

@@ -71,6 +71,8 @@ void app_main(void) {
          * Nếu khi thử tiến tới mà số xung bên Phải tăng (+), nhưng bên Trái lại giảm (-), 
          * bạn cần đảo dấu bằng cách thêm dấu trừ: d_fl = -d_fl; d_rl = -d_rl;
          */
+        d_fl = - d_fl; 
+        d_rl = - d_rl;
         
         // Gộp trung bình xung của cơ cấu Skid-steer (Lấy trung bình 2 bánh cùng 1 bên)
         int delta_left = (d_fl + d_rl) / 2;

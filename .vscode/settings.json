@@ -1,10 +1,16 @@
 {
-  "C_Cpp.intelliSenseEngine": "default",
-  "idf.currentSetup": "C:\\Users\\ADMIN\\esp\\v5.5.1\\esp-idf",
-  "idf.portWin": "COM7",
-  "idf.openOcdConfigs": ["board/esp32s3-builtin.cfg"],
-  "idf.customExtraVars": {
-    "IDF_TARGET": "esp32s3"
-  },
-  "idf.flashType": "UART"
+    "idf.portWin": "COM3",
+    "idf.flashBaudRate": "921600",
+    "idf.flashType": "UART",
+    "idf.adapterType": "esp-bridge",
+    "python.linting.enabled": true,
+    "python.linting.pylintEnabled": true,
+    "C_Cpp.default.cStandard": "c99",
+    "C_Cpp.default.cppStandard": "c++17",
+    "C_Cpp.intelliSenseEngine": "default",
+    "files.exclude": {
+        "**/.git": true,
+        "**/build": true
+    },
+    "idf.currentSetup": "Z:/esp_tools/Espressif/frameworks/esp-idf-v5.5.1/"
 }

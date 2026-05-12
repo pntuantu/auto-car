@@ -8,7 +8,7 @@ static const char *TAG = "KINEMATICS";
 /* --- THÔNG SỐ VẬT LÝ CỦA ROBOT --- */
 #define WHEEL_RADIUS_M  0.0425f  // Bán kính bánh xe 85mm / 2 = 0.0425m
 #define TRACK_WIDTH_M   0.1800f  // Khoảng cách giữa 2 tâm bánh xe (CẦN ĐO THỰC TẾ & CẬP NHẬT)
-#define COUNTS_PER_REV  1560.0f  // Số xung/vòng của JGB37-520
+#define COUNTS_PER_REV  3960.0f  // Số xung/vòng của JGB37-520
 #define MAX_PWM         1023
 
 /* --- TRẠNG THÁI ODOMETRY --- */
